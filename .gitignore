@@ -26,3 +26,7 @@ yarn-error.log*
 
 # Vercel
 .vercel
+
+# Scramjet runtime-downloaded assets
+/.scramjet-assets/
+/node_modules

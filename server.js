@@ -1,141 +1,90 @@
 /**
- * Optional custom server that adds REAL WebSocket proxying on top of Next.js.
+ * Scramjet proxy server.
  *
- * Use this on any Node-capable host (Render / Railway / Fly / VPS / Wasmer that
- * runs `node server.js`). On serverless (Vercel functions) you cannot run this;
- * there the app still works for everything except live WebSockets, which fail
- * gracefully via app/__ep_ws__/[...path]/route.ts.
+ * Uses MercuryWorkshop's Scramjet (via @mercuryworkshop/proxy-bootstrap) which
+ * serves the Scramjet client/service-worker assets and runs the wisp transport.
  *
- *   Start:  node server.js         (production, after `next build`)
- *   Dev:    NODE_ENV=development node server.js
+ *   /go/<base64url>   -> friendly entry: registers the SW and hands the URL to
+ *                        Scramjet, which loads the page and handles redirects,
+ *                        cookies, and the site's own service workers.
+ *
+ * REQUIRES a socket-capable Node host (Render/Railway/Fly/VPS/local). It will
+ * NOT function on Wasmer serverless — wisp needs WebSocket upgrades + raw
+ * outbound sockets, which that runtime does not provide (connect => ENOSYS).
  */
 
-const http = require("http");
-const next = require("next");
-const { WebSocketServer, WebSocket } = require("ws");
+import http from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import express from "express";
+import { bootstrap } from "@mercuryworkshop/proxy-bootstrap";
 
-const dev = process.env.NODE_ENV !== "production";
-const hostname = process.env.HOST || "0.0.0.0";
-const port = parseInt(process.env.PORT || "3000", 10);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const app = next({ dev, hostname, port });
-const handle = app.getRequestHandler();
+// Downloads + prepares Scramjet assets and wires the wisp transport.
+// Absolute asset dir so it works regardless of the process cwd.
+const { routeRequest, routeUpgrade } = await bootstrap({
+  downloadedFilesDir: path.join(__dirname, ".scramjet-assets") + path.sep,
+});
 
-const WS_PREFIX = "/ep-ws/";
+const app = express();
+const PORT = Number(process.env.PORT) || 3030;
+const HOST = process.env.HOST || "0.0.0.0";
 
-// --- helpers (mirror lib/proxy-utils.ts, kept dependency-free) --------------
-
-function decodeBase64Url(input) {
-  if (!input) return "";
-  let cleaned = String(input).trim().replace(/-/g, "+").replace(/_/g, "/");
-  const pad = cleaned.length % 4;
-  if (pad) cleaned += "=".repeat(4 - pad);
-  let decoded = Buffer.from(cleaned, "base64").toString("utf-8");
-  try { if (decoded.includes("%")) decoded = decodeURIComponent(decoded); } catch (_) {}
-  if (!/^[a-z]+:\/\//i.test(decoded)) decoded = "https://" + decoded;
-  return decoded;
-}
-
-function encodeBase64Url(input) {
-  return Buffer.from(String(input), "utf-8").toString("base64")
-    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-// Reconstruct the upstream Cookie header from proxy-host cookies for this origin.
-function forwardCookie(cookieHeader, targetUrl) {
-  if (!cookieHeader) return "";
-  let tag;
-  try { tag = encodeBase64Url(new URL(targetUrl).origin); } catch (_) { return ""; }
-  const want = "__ep_" + tag + "__";
-  const out = [];
-  for (const p of cookieHeader.split(";")) {
-    const seg = p.trim();
-    const eq = seg.indexOf("=");
-    if (eq < 0) continue;
-    const name = seg.slice(0, eq);
-    if (!name.startsWith(want)) continue;
-    out.push(name.slice(want.length) + "=" + seg.slice(eq + 1));
+/**
+ * The `/go/<b64>` API. `<b64>` is a base64url-encoded absolute URL.
+ * We serve a tiny bootstrap page that registers the Scramjet service worker,
+ * then navigates to the Scramjet-encoded URL so the SW takes over.
+ */
+app.get("/go/:b64", (req, res) => {
+  const b64 = req.params.b64;
+  res.set("Content-Type", "text/html; charset=utf-8");
+  res.end(`<!doctype html><html><head><meta charset="utf-8"><title>Loading…</title>
+<style>html,body{margin:0;height:100%;background:#0b0e14;color:#e6edf3;font:15px system-ui,sans-serif;overflow:hidden}
+#frame{position:fixed;inset:0;width:100%;height:100%;border:0;background:#fff}
+#ov{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;background:#0b0e14;transition:opacity .3s;z-index:2}
+.sp{width:34px;height:34px;border:3px solid #2b3550;border-top-color:#6ea8fe;border-radius:50%;animation:s .8s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}} .err{color:#ff7b72;max-width:560px;text-align:center;padding:0 16px}</style>
+<script src="/bootstrap-init.js"></script></head>
+<body>
+<iframe id="frame" allow="autoplay; fullscreen; clipboard-read; clipboard-write; encrypted-media" allowfullscreen></iframe>
+<div id="ov"><div class="sp"></div><div id="m">Starting proxy…</div></div>
+<script>
+(async () => {
+  const m = document.getElementById("m");
+  const ov = document.getElementById("ov");
+  const iframe = document.getElementById("frame");
+  try {
+    const controller = await initBootstrap();
+    await navigator.serviceWorker.ready;
+    let s = ${JSON.stringify(b64)}.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    const url = decodeURIComponent(escape(atob(s)));
+    m.textContent = "Loading " + url;
+    const frame = controller.createFrame(iframe);
+    frame.go(url);
+    iframe.addEventListener("load", () => { ov.style.opacity = "0"; setTimeout(() => ov.remove(), 350); }, { once: true });
+    setTimeout(() => { ov.style.opacity = "0"; setTimeout(() => ov.remove(), 350); }, 6000);
+  } catch (e) {
+    ov.innerHTML =
+      '<div class="err"><b>Proxy failed to start.</b><br>' + (e && e.message ? e.message : e) +
+      '<br><br>This needs a socket-capable Node host (wisp transport). It cannot run on Wasmer serverless.</div>';
   }
-  return out.join("; ");
-}
+})();
+</script></body></html>`);
+});
 
-app.prepare().then(() => {
-  const server = http.createServer((req, res) => handle(req, res));
+// Scramjet asset + bootstrap + service-worker routes (/sw.js, /bootstrap-init.js, /scram/*, /controller/*, /clients/*).
+app.use((req, res, next) => {
+  if (routeRequest(req, res)) return;
+  next();
+});
 
-  // Next's own upgrade handler (HMR websocket in dev, etc.).
-  const nextUpgrade =
-    typeof app.getUpgradeHandler === "function" ? app.getUpgradeHandler() : null;
+// Static frontend (landing page).
+app.use(express.static(path.join(__dirname, "public")));
 
-  const wss = new WebSocketServer({ noServer: true });
-
-  server.on("upgrade", (req, socket, head) => {
-    let pathname = "/";
-    try { pathname = new URL(req.url, "http://localhost").pathname; } catch (_) {}
-
-    if (!pathname.startsWith(WS_PREFIX)) {
-      // Hand non-proxy upgrades (e.g. Next HMR) back to Next.
-      if (nextUpgrade) return nextUpgrade(req, socket, head);
-      socket.destroy();
-      return;
-    }
-
-    const b64 = pathname.slice(WS_PREFIX.length).split("/")[0];
-    let targetUrl;
-    try {
-      targetUrl = decodeBase64Url(b64);
-      const u = new URL(targetUrl);
-      // ws/wss target scheme derived from http/https.
-      if (u.protocol === "https:") u.protocol = "wss:";
-      else if (u.protocol === "http:") u.protocol = "ws:";
-      targetUrl = u.toString();
-    } catch (_) {
-      socket.destroy();
-      return;
-    }
-
-    wss.handleUpgrade(req, socket, head, (client) => {
-      const headers = {};
-      const cookie = forwardCookie(req.headers.cookie, targetUrl);
-      if (cookie) headers["cookie"] = cookie;
-      if (req.headers["user-agent"]) headers["user-agent"] = req.headers["user-agent"];
-      try { headers["origin"] = new URL(targetUrl).origin.replace(/^ws/, "http"); } catch (_) {}
-
-      const subprotocols = (req.headers["sec-websocket-protocol"] || "")
-        .split(",").map((s) => s.trim()).filter(Boolean);
-
-      const upstream = new WebSocket(targetUrl, subprotocols, { headers });
-
-      const closeBoth = (code, reason) => {
-        try { client.close(code, reason); } catch (_) {}
-        try { upstream.close(code, reason); } catch (_) {}
-      };
-
-      // Buffer client->upstream messages sent before the upstream is open,
-      // so nothing sent immediately on connect is dropped.
-      const pending = [];
-      client.on("message", (data, isBinary) => {
-        if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
-        else pending.push([data, isBinary]);
-      });
-      upstream.on("message", (data, isBinary) => {
-        if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
-      });
-      upstream.on("open", () => {
-        for (const [data, isBinary] of pending) {
-          if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
-        }
-        pending.length = 0;
-      });
-
-      client.on("close", (c, r) => closeBoth(c, r));
-      upstream.on("close", (c, r) => closeBoth(c, r));
-      client.on("error", () => closeBoth());
-      upstream.on("error", (e) => { console.error("[ws] upstream error:", e && e.message); closeBoth(1011, "upstream error"); });
-      upstream.on("unexpected-response", (_r, res) => { console.error("[ws] upstream refused:", res.statusCode); closeBoth(1011, "upstream refused"); });
-    });
-  });
-
-  server.listen(port, hostname, () => {
-    console.log(`> Proxy ready on http://${hostname}:${port} (WebSocket proxy enabled)`);
-  });
+const server = http.createServer(app);
+server.on("upgrade", routeUpgrade); // wisp WebSocket transport
+server.listen(PORT, HOST, () => {
+  console.log(`Scramjet proxy on http://${HOST}:${PORT}  (entry: /go/<base64url>)`);
 });

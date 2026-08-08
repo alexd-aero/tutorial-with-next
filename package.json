@@ -1,28 +1,19 @@
 {
-  "name": "tiny-file-manager-proxy",
-  "version": "0.1.0",
+  "name": "scramjet-proxy",
+  "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "next dev -H 0.0.0.0",
-    "build": "next build",
-    "start": "next start -H 0.0.0.0 -p ${PORT:-3000}",
-    "start:node": "NODE_ENV=production node server.js",
-    "dev:node": "NODE_ENV=development node server.js",
-    "lint": "next lint"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
-    "autoprefixer": "^10.4.20",
-    "next": "14.2.23",
-    "postcss": "^8.5.1",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "ws": "^8.18.0"
+    "@mercuryworkshop/proxy-bootstrap": "^0.0.5",
+    "express": "^4.21.2"
   },
   "devDependencies": {
-    "@types/node": "^20.17.14",
-    "@types/ws": "^8.5.13",
-    "@types/react": "^18.3.18",
-    "@types/react-dom": "^18.3.5",
-    "typescript": "^5.7.3"
+    "@mercuryworkshop/scramjet": "^1.1.0",
+    "@mercuryworkshop/scramjet-controller": "^0.0.14",
+    "@mercuryworkshop/scramjet-utils": "^0.0.3"
   }
 }

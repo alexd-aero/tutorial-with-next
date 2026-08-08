@@ -31,6 +31,40 @@ function readSetCookies(headers: Headers): string[] {
   return single ? [single] : [];
 }
 
+/** Strict base64url decode — returns "" if the input isn't valid base64. */
+function strictB64Decode(seg: string): string {
+  try {
+    let t = seg.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = t.length % 4;
+    if (pad) t += "=".repeat(4 - pad);
+    return Buffer.from(t, "base64").toString("utf-8");
+  } catch {
+    return "";
+  }
+}
+
+/** A path segment "looks encoded" if it base64-decodes to an http(s) URL. */
+function looksEncoded(seg: string): boolean {
+  return /^https?:\/\//i.test(strictB64Decode(seg));
+}
+
+/**
+ * Given a proxied URL (e.g. a Referer like https://proxy/<b64> or
+ * https://proxy/wbpge/<b64>), recover the real target URL it points at.
+ */
+function targetFromProxyUrl(proxyUrl: string): string | null {
+  try {
+    let p = new URL(proxyUrl).pathname.replace(/^\//, "");
+    if (p.startsWith("wbpge/")) p = p.slice(6);
+    else if (p.startsWith("ep-ws/")) p = p.slice(6);
+    const seg = p.split(/[/?#]/)[0];
+    if (!seg || !looksEncoded(seg)) return null;
+    return decodeBase64Url(seg);
+  } catch {
+    return null;
+  }
+}
+
 export async function handleProxyRequest(
   req: NextRequest,
   rawPath: string[],
@@ -47,25 +81,36 @@ export async function handleProxyRequest(
   }
 
   const b64Segment = rawPath[0];
-  if (IGNORED_STATIC_PATHS.has(b64Segment.toLowerCase())) {
-    return new Response(null, { status: 404 });
-  }
-
-  const targetBaseUrl = decodeBase64Url(b64Segment);
-  if (!targetBaseUrl || !/^https?:\/\//i.test(targetBaseUrl)) {
-    return jsonError(400, {
-      error: "Invalid Base64 target URL.",
-      providedSegment: b64Segment,
-      decoded: targetBaseUrl,
-    });
-  }
 
   try {
-    const subPath = rawPath.slice(1).join("/");
-    const targetParsedUrl = new URL(targetBaseUrl);
+    let targetParsedUrl: URL;
+    let targetBaseUrl: string;
 
-    if (subPath) {
-      targetParsedUrl.pathname = targetParsedUrl.pathname.replace(/\/$/, "") + "/" + subPath;
+    if (looksEncoded(b64Segment)) {
+      // Normal case: first segment is the base64-encoded target URL.
+      targetBaseUrl = decodeBase64Url(b64Segment);
+      targetParsedUrl = new URL(targetBaseUrl);
+      const subPath = rawPath.slice(1).join("/");
+      if (subPath) {
+        targetParsedUrl.pathname = targetParsedUrl.pathname.replace(/\/$/, "") + "/" + subPath;
+      }
+    } else {
+      // Escaped root-relative request (e.g. /youtubei/v1/feedback) that slipped
+      // past client interception — common with Web Workers and location.href=.
+      // Reconstruct the intended target from the Referer, the same way a
+      // service worker would from the client's context.
+      if (IGNORED_STATIC_PATHS.has(b64Segment.toLowerCase())) {
+        return new Response(null, { status: 404 });
+      }
+      const refTarget = targetFromProxyUrl(req.headers.get("referer") || "");
+      if (!refTarget) {
+        return jsonError(400, {
+          error: "Unproxiable path (no encoded target and no usable Referer).",
+          providedSegment: b64Segment,
+        });
+      }
+      targetParsedUrl = new URL("/" + rawPath.join("/"), refTarget);
+      targetBaseUrl = targetParsedUrl.origin;
     }
 
     // Preserve query params.
@@ -170,7 +215,7 @@ export async function handleProxyRequest(
     return jsonError(502, {
       error: "Proxy Request Failed",
       details: errorMessage,
-      targetUrl: targetBaseUrl,
+      segment: b64Segment,
     });
   }
 }

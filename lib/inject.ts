@@ -54,24 +54,53 @@ export function getInjectionScript(config: InjectConfig): string {
 
   var SKIP = /^(data:|blob:|javascript:|about:|mailto:|tel:|sms:|magnet:|#)/i;
 
+  // Decode a base64url segment; returns "" if it isn't valid base64.
+  function b64decode(seg){
+    try {
+      var t = seg.replace(/-/g,"+").replace(/_/g,"/");
+      var pad = t.length % 4; if (pad) t += "====".slice(pad);
+      return decodeURIComponent(escape(atob(t)));
+    } catch(e){ return ""; }
+  }
+
+  // Is this path already a proxied path? (first segment decodes to an http URL)
+  // String ops only — regex backslashes don't survive the template literal.
+  function isProxiedPath(pathname){
+    var p = pathname.charAt(0) === "/" ? pathname.slice(1) : pathname;
+    if (p.indexOf("wbpge/") === 0) p = p.slice(6);
+    else if (p.indexOf("ep-ws/") === 0) p = p.slice(6);
+    var seg = p.split("/")[0].split("?")[0].split("#")[0];
+    if (!seg) return false;
+    var d = b64decode(seg).toLowerCase();
+    return d.indexOf("http://") === 0 || d.indexOf("https://") === 0;
+  }
+
   // Turn any URL the page uses into a proxied URL on this origin.
-  function rewrite(raw, prefixOverride){
+  //
+  // The critical case: when the route prefix is "/", a naive "starts with /"
+  // check treats EVERY root-relative URL (e.g. /youtubei/v1/feedback) as
+  // already-proxied and lets it escape. We instead detect proxied URLs by
+  // testing whether the first path segment base64-decodes to a real URL.
+  function rewrite(raw){
     try {
       if (raw == null) return raw;
       var url = String(raw);
       if (!url || SKIP.test(url)) return raw;
 
-      var pfx = prefixOverride || CFG.prefix;
+      var pfx = CFG.prefix;
 
-      // Already proxied? Leave it alone.
-      if (url.indexOf(PROXY_ORIGIN + pfx) === 0) return url;
-      if (url.charAt(0) === "/" && url.indexOf(pfx) === 0) return url;
+      // Absolute URL already on the proxy origin.
+      if (url.indexOf(PROXY_ORIGIN) === 0) {
+        var rest = url.slice(PROXY_ORIGIN.length) || "/";
+        if (isProxiedPath(rest)) return url;                 // genuinely proxied
+        return PROXY_ORIGIN + pfx + b64encode(new URL(rest, CFG.target).href);
+      }
 
-      // Resolve relative to the *target* document, not the proxy origin.
-      var abs = new URL(url, CFG.target).href;
+      // Root-relative path that is already a proxied path.
+      if (url.charAt(0) === "/" && isProxiedPath(url)) return url;
 
-      // WebSocket URLs get the dedicated ws prefix (handled below anyway).
-      return PROXY_ORIGIN + pfx + b64encode(abs);
+      // Everything else: resolve relative to the *target* document and proxy it.
+      return PROXY_ORIGIN + pfx + b64encode(new URL(url, CFG.target).href);
     } catch(e){ return raw; }
   }
 

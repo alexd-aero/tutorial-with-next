@@ -311,64 +311,67 @@ export function rewriteHtmlContent(
   const base = new URL(targetUrl);
   const prefix = routePrefix.endsWith("/") ? routePrefix : `${routePrefix}/`;
 
-  let out = html;
-
-  // 0. Mask INLINE <script> bodies so URL/CSS rewriting can't corrupt JS/JSON.
-  //    Keep the opening tag (so external `src` still gets rewritten); stash only
-  //    the content between the tags.
-  const scriptBodies: string[] = [];
-  out = out.replace(
-    /(<script\b[^>]*>)([\s\S]*?)(<\/script>)/gi,
-    (_m, open, body, close) => {
-      if (!body) return `${open}${close}`;
-      scriptBodies.push(body);
-      return `${open}__EPJS${scriptBodies.length - 1}__${close}`;
-    }
-  );
-
-  // 1. URL-bearing attributes (excludes `data`/`background` — too collision-prone).
-  out = out.replace(
-    /\b(href|src|action|poster|formaction)\s*=\s*(["'])(.*?)\2/gi,
-    (_m, attr, quote, val) => `${attr}=${quote}${resolveToProxy(val, base, prefix)}${quote}`
-  );
-
-  // 2. srcset (comma-separated candidate list).
-  out = out.replace(
-    /\bsrcset\s*=\s*(["'])(.*?)\1/gi,
-    (_m, quote, val) => `srcset=${quote}${rewriteSrcset(val, base, prefix)}${quote}`
-  );
-
-  // 3. <meta http-equiv="refresh" content="5; url=...">
-  out = out.replace(
-    /(<meta[^>]+http-equiv\s*=\s*["']refresh["'][^>]*content\s*=\s*["'][^"']*url=)([^"']+)(["'])/gi,
-    (_m, pre, url, post) => `${pre}${resolveToProxy(url, base, prefix)}${post}`
-  );
-
-  // 4. CSS url() / @import across inline styles and <style> blocks.
-  out = out.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi,
-    (_m, q, val) => `url(${q}${resolveToProxy(val, base, prefix)}${q})`);
-  out = out.replace(/@import\s+(["'])([^"']+)\1/gi,
-    (_m, q, val) => `@import ${q}${resolveToProxy(val, base, prefix)}${q}`);
-
-  // 5. Strip SRI + CSP nonces (they break after we rewrite / strip CSP).
-  out = out.replace(/\s+integrity\s*=\s*(["']).*?\1/gi, "");
-  out = out.replace(/\s+nonce\s*=\s*(["']).*?\1/gi, "");
-
-  // 6. Neutralize <base href> (our rewriter already resolved against target).
-  out = out.replace(/<base\b[^>]*>/gi, "");
-
-  // 6b. Restore the untouched inline <script> bodies.
-  out = out.replace(/__EPJS(\d+)__/g, (_m, i) => scriptBodies[Number(i)] ?? "");
-
-  // 7. Inject the runtime interception script at the very top of the document.
   const script = `<script>${getInjectionScript({ prefix, target: targetUrl })}</script>`;
-  if (/<head[^>]*>/i.test(out)) {
-    out = out.replace(/<head[^>]*>/i, (m) => `${m}${script}`);
-  } else if (/<html[^>]*>/i.test(out)) {
-    out = out.replace(/<html[^>]*>/i, (m) => `${m}${script}`);
-  } else {
-    out = script + out;
-  }
 
-  return out;
+  // Minimal, low-memory injection used as-is on huge pages and as an OOM
+  // fallback. Because the client runtime + server-side Referer reconstruction
+  // resolve URLs at request time, a page with ONLY the runtime injected still
+  // works — full static rewriting is an optimization, not a requirement.
+  const injectOnly = (h: string): string => {
+    if (/<head[^>]*>/i.test(h)) return h.replace(/<head[^>]*>/i, (m) => `${m}${script}`);
+    if (/<html[^>]*>/i.test(h)) return h.replace(/<html[^>]*>/i, (m) => `${m}${script}`);
+    return script + h;
+  };
+
+  // Very large documents: skip the multi-pass static rewrite entirely to avoid
+  // memory spikes on constrained (serverless/WASIX) hosts.
+  if (html.length > 1_500_000) return injectOnly(html);
+
+  try {
+    let out = html;
+
+    // 1. Mask inline <script> bodies so URL/CSS rewriting can't corrupt JS/JSON.
+    const scriptBodies: string[] = [];
+    out = out.replace(
+      /(<script\b[^>]*>)([\s\S]*?)(<\/script>)/gi,
+      (_m, open, body, close) => {
+        if (!body) return `${open}${close}`;
+        scriptBodies.push(body);
+        return `${open}__EPJS${scriptBodies.length - 1}__${close}`;
+      }
+    );
+
+    // 2. One combined pass: URL attributes, srcset, and SRI/nonce stripping.
+    out = out.replace(
+      /\b(href|src|action|poster|formaction|srcset|integrity|nonce)\s*=\s*(["'])([\s\S]*?)\2/gi,
+      (_m, attr, quote, val) => {
+        const a = (attr as string).toLowerCase();
+        if (a === "integrity" || a === "nonce") return "";
+        if (a === "srcset") return `srcset=${quote}${rewriteSrcset(val, base, prefix)}${quote}`;
+        return `${attr}=${quote}${resolveToProxy(val, base, prefix)}${quote}`;
+      }
+    );
+
+    // 3. <meta http-equiv="refresh" content="5; url=...">
+    out = out.replace(
+      /(<meta[^>]+http-equiv\s*=\s*["']refresh["'][^>]*content\s*=\s*["'][^"']*url=)([^"']+)(["'])/gi,
+      (_m, pre, url, post) => `${pre}${resolveToProxy(url, base, prefix)}${post}`
+    );
+
+    // 4. CSS url() / @import across inline styles and <style> blocks.
+    out = out.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi,
+      (_m, q, val) => `url(${q}${resolveToProxy(val, base, prefix)}${q})`);
+    out = out.replace(/@import\s+(["'])([^"']+)\1/gi,
+      (_m, q, val) => `@import ${q}${resolveToProxy(val, base, prefix)}${q}`);
+
+    // 5. Neutralize <base href> (our rewriter already resolved against target).
+    out = out.replace(/<base\b[^>]*>/gi, "");
+
+    // 6. Restore inline <script> bodies, then inject the runtime.
+    out = out.replace(/__EPJS(\d+)__/g, (_m, i) => scriptBodies[Number(i)] ?? "");
+    return injectOnly(out);
+  } catch {
+    // Out-of-memory or any rewrite failure: fall back to runtime-only injection.
+    return injectOnly(html);
+  }
 }

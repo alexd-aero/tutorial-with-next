@@ -99,11 +99,12 @@ export async function handleProxyRequest(
       // past client interception — common with Web Workers and location.href=.
       // Reconstruct the intended target from the Referer, the same way a
       // service worker would from the client's context.
-      if (IGNORED_STATIC_PATHS.has(b64Segment.toLowerCase())) {
-        return new Response(null, { status: 404 });
-      }
       const refTarget = targetFromProxyUrl(req.headers.get("referer") || "");
       if (!refTarget) {
+        // No context to reconstruct from: 404 for known browser noise, else 400.
+        if (IGNORED_STATIC_PATHS.has(b64Segment.toLowerCase())) {
+          return new Response(null, { status: 404 });
+        }
         return jsonError(400, {
           error: "Unproxiable path (no encoded target and no usable Referer).",
           providedSegment: b64Segment,

@@ -133,13 +133,67 @@ function entryHtml(b64) {
     setTimeout(function () { ov.classList.add("hide"); setTimeout(function () { ov.remove(); }, 550); }, 550);
   }
 
-  try {
-    var controller = await initBootstrap();
-    // Trim rewriter overhead so heavy players (YouTube base.js) don't OOM/crash.
+  // Boot Scramjet with sourcemaps OFF (the big memory hog that crashes heavy
+  // players like YouTube) — baked in at controller construction, not after.
+  // Falls back to the stock bootstrap path if anything here changes upstream.
+  async function bootWithFlags() {
+    var FLAGS = {
+      syncxhr: false, disableComputedWrap: false, rewriterLogs: false,
+      captureErrors: true, cleanErrors: true, scramitize: false,
+      sourcemaps: false, destructureRewrites: true, allowInvalidJs: true,
+      debugTrampolines: false, allowFailedIntercepts: true,
+      encapsulateWorkers: true, debugSourceURL: false
+    };
+    function loadScript(src) {
+      return new Promise(function (res, rej) {
+        var s = document.createElement("script");
+        s.src = src; s.onload = function () { res(); };
+        s.onerror = function () { rej(new Error("load " + src)); };
+        document.head.appendChild(s);
+      });
+    }
+    async function registerSw(path) {
+      var reg = await navigator.serviceWorker.register(path, { type: "classic", updateViaCache: "none" });
+      await navigator.serviceWorker.ready;
+      if (reg.active) return reg.active;
+      var inst = reg.installing || reg.waiting;
+      if (inst) {
+        await new Promise(function (res) {
+          inst.addEventListener("statechange", function h() {
+            if (inst.state === "activated") { inst.removeEventListener("statechange", h); res(); }
+          });
+        });
+      }
+      return navigator.serviceWorker.controller || reg.active;
+    }
     try {
-      var f = controller && controller.scramjetConfig && controller.scramjetConfig.flags;
-      if (f) { f.sourcemaps = false; f.scramitize = false; f.rewriterLogs = false; f.cleanErrors = true; }
-    } catch (_) {}
+      var sw = await registerSw("/sw.js");
+      await loadScript("/scram/scramjet.js");
+      await loadScript("/controller/controller.api.js");
+      await loadScript("/scram/scramjet-utils.js");
+      var wisp = (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/wisp/";
+      await loadScript("/clients/libcurl-client.js");
+      var transport = new window.LibcurlTransport.LibcurlClient({ wisp: wisp });
+      var C = window.$scramjetController;
+      C.config.injectPath = "/controller/controller.inject.js";
+      C.config.wasmPath = "/scram/scramjet.wasm";
+      C.config.scramjetPath = "/scram/scramjet.js";
+      var ctl = new C.Controller({ serviceworker: sw, transport: transport, scramjetConfig: { flags: FLAGS } });
+      if (ctl.wait) { try { await ctl.wait(); } catch (_) {} }
+      return ctl;
+    } catch (err) {
+      // Fallback: stock bootstrap (still flips flags best-effort).
+      var ctl2 = await initBootstrap();
+      try {
+        var f = ctl2 && ctl2.scramjetConfig && ctl2.scramjetConfig.flags;
+        if (f) { f.sourcemaps = false; f.allowFailedIntercepts = true; f.captureErrors = true; }
+      } catch (_) {}
+      return ctl2;
+    }
+  }
+
+  try {
+    var controller = await bootWithFlags();
     await navigator.serviceWorker.ready;
     var frame = controller.createFrame(iframe);
     frame.go(url);

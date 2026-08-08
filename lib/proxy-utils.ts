@@ -105,6 +105,28 @@ export function sanitizeRequestHeaders(headers: Headers, targetUrl: string): Hea
   // Ask upstream for identity encoding so we can safely rewrite text bodies.
   clean.set("accept-encoding", "identity");
 
+  // Mimic a real, current browser so origin servers don't serve us a bot page.
+  // Only fill what the caller didn't already send (real browsers send their own).
+  if (!clean.has("user-agent")) {
+    clean.set(
+      "user-agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    );
+  }
+  if (!clean.has("accept")) {
+    clean.set(
+      "accept",
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    );
+  }
+  if (!clean.has("accept-language")) clean.set("accept-language", "en-US,en;q=0.9");
+  if (!clean.has("sec-ch-ua")) {
+    clean.set("sec-ch-ua", '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"');
+    clean.set("sec-ch-ua-mobile", "?0");
+    clean.set("sec-ch-ua-platform", '"Windows"');
+  }
+  if (!clean.has("upgrade-insecure-requests")) clean.set("upgrade-insecure-requests", "1");
+
   return clean;
 }
 
@@ -146,21 +168,21 @@ export function getCorsHeaders(): Headers {
 // namespaced cookies that belong to the target origin.
 // ---------------------------------------------------------------------------
 
-function originTag(targetUrl: string): string {
-  try {
-    const o = new URL(targetUrl).origin;
-    return encodeBase64Url(o);
-  } catch {
-    return "_";
-  }
+// Cookie scope host: the Domain attribute (dot stripped) if present, else the
+// exact request host. This preserves real cookie semantics — a cookie set with
+// Domain=.youtube.com is shared across www./consent./m.youtube.com, which is
+// exactly what login/consent flows depend on.
+function scopeTag(host: string): string {
+  return encodeBase64Url(host.toLowerCase());
 }
 
 /**
  * Rewrite upstream Set-Cookie headers so they persist on the proxy host,
- * namespaced per target origin, with Domain stripped and Path normalized.
+ * namespaced by cookie scope host (honoring Domain), with Path normalized.
  */
 export function rewriteSetCookie(setCookies: string[], targetUrl: string): string[] {
-  const tag = originTag(targetUrl);
+  let reqHost = "";
+  try { reqHost = new URL(targetUrl).hostname.toLowerCase(); } catch { /* noop */ }
   const out: string[] = [];
 
   for (const raw of setCookies) {
@@ -172,43 +194,45 @@ export function rewriteSetCookie(setCookies: string[], targetUrl: string): strin
 
     const name = nameVal.slice(0, eq).trim();
     const value = nameVal.slice(eq + 1).trim();
-    const newName = `__ep_${tag}__${name}`;
 
     const attrs: string[] = [];
     let sawSameSite = false;
-    let sawSecure = false;
+    let scopeHost = reqHost;
 
     for (const attr of parts) {
       const a = attr.trim();
       const lower = a.toLowerCase();
-      if (lower.startsWith("domain=")) continue;       // pin to proxy host
+      if (lower.startsWith("domain=")) {
+        scopeHost = a.slice(a.indexOf("=") + 1).trim().replace(/^\./, "").toLowerCase() || reqHost;
+        continue; // Domain is encoded into the name, not kept on the proxy cookie
+      }
       if (lower.startsWith("path=")) continue;         // normalized below
-      if (lower === "samesite=none") { sawSameSite = true; attrs.push("SameSite=None"); continue; }
       if (lower.startsWith("samesite=")) { sawSameSite = true; attrs.push(a); continue; }
-      if (lower === "secure") { sawSecure = true; attrs.push("Secure"); continue; }
-      attrs.push(a); // Expires, Max-Age, HttpOnly (dropped below), etc.
+      attrs.push(a); // Expires, Max-Age, Secure, HttpOnly (dropped below), etc.
     }
 
-    // We need JS + cross-context reads, so never HttpOnly on the proxy side.
-    const noHttpOnly = attrs.filter((a) => a.toLowerCase() !== "httponly");
-    noHttpOnly.push("Path=/");
-    if (!sawSameSite) noHttpOnly.push("SameSite=Lax");
-    void sawSecure;
+    const newName = `__ep_${scopeTag(scopeHost)}__${name}`;
 
-    out.push(`${newName}=${value}; ${noHttpOnly.join("; ")}`);
+    // Must be JS/cross-context readable on the proxy side, so drop HttpOnly.
+    const clean = attrs.filter((a) => a.toLowerCase() !== "httponly");
+    clean.push("Path=/");
+    if (!sawSameSite) clean.push("SameSite=Lax");
+
+    out.push(`${newName}=${value}; ${clean.join("; ")}`);
   }
 
   return out;
 }
 
 /**
- * Rebuild the Cookie header to send upstream, from the proxy-host cookies that
- * belong to the target origin.
+ * Rebuild the Cookie header to send upstream. A stored cookie scoped to host S
+ * is sent to target host H when H === S or H is a subdomain of S — matching
+ * standard cookie Domain-match rules.
  */
 export function buildForwardCookieHeader(proxyCookieHeader: string | null, targetUrl: string): string {
   if (!proxyCookieHeader) return "";
-  const tag = originTag(targetUrl);
-  const wantPrefix = `__ep_${tag}__`;
+  let host = "";
+  try { host = new URL(targetUrl).hostname.toLowerCase(); } catch { return ""; }
 
   const pairs = proxyCookieHeader.split(";");
   const forwarded: string[] = [];
@@ -218,10 +242,11 @@ export function buildForwardCookieHeader(proxyCookieHeader: string | null, targe
     const eq = seg.indexOf("=");
     if (eq < 0) continue;
     const name = seg.slice(0, eq);
-    if (!name.startsWith(wantPrefix)) continue;
-    const realName = name.slice(wantPrefix.length);
-    const value = seg.slice(eq + 1);
-    forwarded.push(`${realName}=${value}`);
+    const m = /^__ep_([A-Za-z0-9_-]+)__(.+)$/.exec(name);
+    if (!m) continue;
+    const scopeHost = decodeBase64Url(m[1]).replace(/^https?:\/\//, ""); // scope stored as bare host
+    if (!(host === scopeHost || host.endsWith("." + scopeHost))) continue;
+    forwarded.push(`${m[2]}=${seg.slice(eq + 1)}`);
   }
 
   return forwarded.join("; ");
@@ -288,9 +313,22 @@ export function rewriteHtmlContent(
 
   let out = html;
 
-  // 1. URL-bearing attributes.
+  // 0. Mask INLINE <script> bodies so URL/CSS rewriting can't corrupt JS/JSON.
+  //    Keep the opening tag (so external `src` still gets rewritten); stash only
+  //    the content between the tags.
+  const scriptBodies: string[] = [];
   out = out.replace(
-    /\b(href|src|action|poster|formaction|data|background)\s*=\s*(["'])(.*?)\2/gi,
+    /(<script\b[^>]*>)([\s\S]*?)(<\/script>)/gi,
+    (_m, open, body, close) => {
+      if (!body) return `${open}${close}`;
+      scriptBodies.push(body);
+      return `${open}__EPJS${scriptBodies.length - 1}__${close}`;
+    }
+  );
+
+  // 1. URL-bearing attributes (excludes `data`/`background` — too collision-prone).
+  out = out.replace(
+    /\b(href|src|action|poster|formaction)\s*=\s*(["'])(.*?)\2/gi,
     (_m, attr, quote, val) => `${attr}=${quote}${resolveToProxy(val, base, prefix)}${quote}`
   );
 
@@ -318,6 +356,9 @@ export function rewriteHtmlContent(
 
   // 6. Neutralize <base href> (our rewriter already resolved against target).
   out = out.replace(/<base\b[^>]*>/gi, "");
+
+  // 6b. Restore the untouched inline <script> bodies.
+  out = out.replace(/__EPJS(\d+)__/g, (_m, i) => scriptBodies[Number(i)] ?? "");
 
   // 7. Inject the runtime interception script at the very top of the document.
   const script = `<script>${getInjectionScript({ prefix, target: targetUrl })}</script>`;

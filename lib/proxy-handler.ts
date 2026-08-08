@@ -87,12 +87,25 @@ export async function handleProxyRequest(
       redirect: "manual", // handle redirects ourselves, staying on the proxy host
     };
 
-    if (["POST", "PUT", "PATCH", "DELETE"].includes(method) && req.body) {
-      fetchOptions.body = req.body;
-      fetchOptions.duplex = "half";
+    // Buffer the body (rather than stream) so the request is replayable on
+    // retry and maximally compatible with serverless fetch runtimes (Wasmer).
+    if (!["GET", "HEAD"].includes(method)) {
+      const buf = await req.arrayBuffer();
+      if (buf.byteLength > 0) fetchOptions.body = buf;
     }
 
-    const targetResponse = await fetch(targetUrlString, fetchOptions);
+    // One retry on transient upstream failures (some hosts have flaky egress).
+    let targetResponse: Response;
+    try {
+      targetResponse = await fetch(targetUrlString, fetchOptions);
+    } catch (firstErr) {
+      await new Promise((r) => setTimeout(r, 250));
+      try {
+        targetResponse = await fetch(targetUrlString, fetchOptions);
+      } catch {
+        throw firstErr;
+      }
+    }
 
     const responseHeaders = sanitizeResponseHeaders(targetResponse.headers);
 

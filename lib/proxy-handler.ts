@@ -213,9 +213,20 @@ export async function handleProxyRequest(
     });
   } catch (err: unknown) {
     const errorMessage = err instanceof Error ? err.message : String(err);
+    // Node's fetch hides the real reason in .cause — surface the whole chain.
+    const causes: string[] = [];
+    let c: unknown = (err as { cause?: unknown })?.cause;
+    let depth = 0;
+    while (c && depth < 5) {
+      const cc = c as { message?: string; code?: string; cause?: unknown };
+      causes.push(cc.code ? `${cc.code}: ${cc.message ?? ""}`.trim() : String(cc.message ?? cc));
+      c = cc.cause;
+      depth++;
+    }
     return jsonError(502, {
       error: "Proxy Request Failed",
       details: errorMessage,
+      cause: causes,
       segment: b64Segment,
     });
   }
